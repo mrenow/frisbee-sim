@@ -8,6 +8,25 @@ export interface FrisbeeState {
   time: number;
 }
 
+export class Frisbee {
+  area: number;
+  mass: number;
+  radius: number;
+  dragCoefficient: number;
+  liftCoefficient: number;
+  pitchingMoment: number;
+  centerOfLiftRadius: number;
+
+  constructor(area? : number, mass? : number, radius? : number, dragCoefficient? : number, liftCoefficient? : number, centerOfLiftRadius? : number) {
+    this.area = area || Math.PI * 0.09; // Frisbee cross-sectional area in m^2
+    this.mass = mass || 0.175; // Frisbee mass in kg
+    this.radius = radius || 0.1; // Frisbee radius in m
+    this.dragCoefficient = dragCoefficient || 0.2; // Drag coefficient
+    this.liftCoefficient = liftCoefficient || 0.3; // Lift coefficient
+    this.centerOfLiftRadius = centerOfLiftRadius || 0.05; // Center of lift radius in m
+  }
+}
+
 export class PhysicsEngine {
   private state: FrisbeeState;
   private initalState: FrisbeeState;
