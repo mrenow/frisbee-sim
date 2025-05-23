@@ -62,12 +62,13 @@ class DudeBro(RigidBodyShape):
         ]
 
 class Frisbee(RigidBodyShape):
-    InertiaTensor = np.diag([0.1, 0.5, 0.1])
-    def __init__(self):
+    def __init__(self, mass=2, radius=1.0):
         """
         Frisbee shape
         """
-        radius = 1
+        # Inertia of a thin disk
+        self.InertiaTensor = 0.5 * radius * radius * mass * np.diag([0.5, 1, 0.5])
+
         depth = 0.1
         self.body = cylinder(pos=vector(0, -depth/2, 0), axis=vector(0, depth, 0), radius=radius, color=color.blue)
         self.xaxis = box(pos=vector(0, 0, 0), axis=vector(1, 0, 0), length=2*radius, height=2*depth, width=depth, color=color.red)
@@ -86,7 +87,7 @@ class Frisbee(RigidBodyShape):
 
 
 class RigidBodyVPythonSimulation:
-    def __init__(self, obj, q0, omega0):
+    def __init__(self, obj, q0, momentum):
         """
         Initialize the VPython visualization for the rigid body simulation.
 
@@ -98,6 +99,7 @@ class RigidBodyVPythonSimulation:
         """
         self.object = obj
         I = obj.InertiaTensor
+        omega0 = np.linalg.inv(I) @ momentum
         self.simulation = RigidBodySimulation(I, q0, omega0)
 
 
@@ -120,16 +122,23 @@ class RigidBodyVPythonSimulation:
         self.angular_velocity_arrow = arrow(pos=vector(0, 0, 0), axis=self.arrow_scale*vector(*self.angular_velocity_intertial), shaftwidth=0.1, color=color.yellow)
         self.angular_momentum_arrow = arrow(pos=vector(0, 0, 0), axis=self.arrow_scale*vector(*self.angular_momentum_intertial), shaftwidth=0.1, color=color.blue)
 
+        self.orientation_arrow = arrow(pos=vector(0, 0, 0), axis=self.arrow_scale*vector(*Quaternion.rotate(q0, np.array([0.0,1.0, 0.0]))), shaftwidth=0.1, color=color.white)
+
         self.body_torque_arrow = arrow(pos=vector(0, 0, 0), axis=self.arrow_scale*vector(*Quaternion.rotate(q0, self.body_torque)), shaftwidth=0.1, color=color.green)
 
 
         self.inertial_torque_arrow = arrow(pos=vector(0, 0, 0), axis=self.arrow_scale*vector(*self.inertial_torque), shaftwidth=0.1, color=color.red)
 
+        
         self.total_torque = Quaternion.rotate(q0, self.body_torque) + self.inertial_torque
+
+
 
         self.floor = box(pos=vector(0, -5, 0), axis=vector(1, 0, 0), length=100, height=0.1, width=100, color=color.white)
         self.axis_x = arrow(pos=vector(0, -5, 0), axis=vector(100, 0, 0), shaftwidth=0.1, color=color.red)
         self.axis_z = arrow(pos=vector(0, -5, 0), axis=vector(0, 0, 100), shaftwidth=0.1, color=color.green)
+
+        
 
 
         # Text overlay
@@ -140,6 +149,7 @@ class RigidBodyVPythonSimulation:
 
         # Controls
         self.mouse_focus = False
+        self.running = True
         self.keymap = {}
 
         # Set movable camera
@@ -197,6 +207,12 @@ class RigidBodyVPythonSimulation:
             self.inertial_torque = mag* np.array([0.0, 0.0, 0.0])
         # self.inertial_torque = np.array([0.0, 0.0, 1.0])
 
+        orientation = Quaternion.rotate(self.simulation.q, np.array([0.0, 1.0, 0.0]))
+        flutter_torque_coefficient = 0.1
+        flutter_torque = orientation * (self.angular_velocity_intertial @ orientation) - self.angular_velocity_intertial 
+        flutter_torque = flutter_torque * np.linalg.norm(flutter_torque) * flutter_torque_coefficient
+
+        self.inertial_torque += flutter_torque  
 
         self.total_torque = Quaternion.rotate(self.simulation.q, self.body_torque) + self.inertial_torque
 
@@ -225,6 +241,7 @@ class RigidBodyVPythonSimulation:
         self.inertial_torque_arrow.axis=self.arrow_scale*vector(*self.inertial_torque)
         self.body_torque_arrow.pos = self.angular_momentum_arrow.pos + self.angular_momentum_arrow.axis
         self.inertial_torque_arrow.pos = self.angular_momentum_arrow.pos + self.angular_momentum_arrow.axis
+        self.orientation_arrow.axis=self.arrow_scale*vector(*Quaternion.rotate(q, np.array([0.0, 1.0, 0.0])))
 
         text_pieces = [
             f"Angular Momentum: {self.angular_momentum_intertial[0]:.2f}, {self.angular_momentum_intertial[1]:.2f}, {self.angular_momentum_intertial[2]:.2f}\n" \
@@ -279,17 +296,22 @@ class RigidBodyVPythonSimulation:
         - t_end: End time for the simulation
         """
         t = time.time()
+        simtime = 0
         while t_end < 0 or t < t_end:
             rate(200)  # Limit the simulation to 100 frames per second
-
-            # Step the simulation
+            
             dt = time.time() - t
             self.update_controls(t, dt)
-            self.simulation.update(dt, self.total_torque)
-            self.update_quantities()
             self.update_camera(dt)
+            if self.running:
+
+                # Step the simulation
+                self.simulation.update(dt, self.total_torque)
+                self.update_quantities()
+                simtime += dt
+                
             self.update_graphics()
-            
+
             t = time.time()
 
     def handle_input(self, event):
@@ -301,6 +323,8 @@ class RigidBodyVPythonSimulation:
         """
         if event.key == 'esc':
             self.mouse_focus = not self.mouse_focus
+        if event.key == 'p':
+            self.running = not self.running
         
     def handle_mouse(self, event):
         """
@@ -321,8 +345,8 @@ class RigidBodyVPythonSimulation:
 if __name__ == "__main__":
     # Example parameters
     q0 = np.array([1.0, 0.0, 0.0, 0.0])
-    omega0 = np.array([0.0, 5.0, 1])
+    amomentum = np.array([10.0, 0.0, 0])
 
-    sim = RigidBodyVPythonSimulation(Frisbee(), q0, omega0)
+    sim = RigidBodyVPythonSimulation(Frisbee(), q0, amomentum)
 
     sim.run(-1)
