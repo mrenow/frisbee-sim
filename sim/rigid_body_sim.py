@@ -5,6 +5,7 @@ import numpy as np
 from sim.rigid_body import FrisbeeSimulation
 from sim.math import Quaternion
 
+np.set_printoptions(formatter={'float': '{: 0.3f}'.format})
 
 class RigidBodyShape:
 
@@ -105,17 +106,17 @@ class Frisbee(RigidBodyShape):
         ]
 
 
-class FormulaInterface[T](Protocol):
-    def __call__(self, simulation: T, deps: dict[str, f64array], /) -> f64array:
+class FormulaInterface[T, R: f64any](Protocol):
+    def __call__(self, simulation: T, deps: dict[str, f64any], /) -> R:
         ...
 
 
-class Quantity[T]:
+class Quantity[T, R: f64any]:
     '''
     A strategy of obtaining a quantity from the simulation
     '''
 
-    def __init__(self, simulation: T, name: str, formula: FormulaInterface[T], depends: Sequence['Quantity'] = []):
+    def __init__(self, simulation: T, name: str, formula: FormulaInterface[T, R], depends: Sequence['Quantity'] = []):
         self.name = name
         self._simulation = simulation
         self._formula = formula
@@ -140,10 +141,15 @@ class Quantity[T]:
                 self._simulation, {d.name: d.value for d in self.depends})
 
     def __str__(self):
-        return f"{self.name}: {self.value}"
+        value = self.value
+        if isinstance(value, float):
+            value = f"{value:.3f}"  # Format float to 3 decimal places
+        elif isinstance(value, int):
+            value = str(value)  # Convert int to string
+        return f"{self.name}: {value}"
 
 
-class DirectQuantity(Quantity[Any]):
+class DirectQuantity[R: f64any](Quantity[Any, R]):
     '''
     A simulation vector quantity that is not dependent on a simulation or other quantities
     this can be used as a constant value or an external variable.
@@ -162,7 +168,7 @@ class DirectQuantity(Quantity[Any]):
         pass
 
 
-class ArrowQuantity[T](Quantity[T]):
+class ArrowQuantity[T](Quantity[T, f64array]):
     '''
     A simulation vector quantity that is represented by an arrow
     It's position may be derived via another quantity
@@ -171,9 +177,9 @@ class ArrowQuantity[T](Quantity[T]):
     def __init__(self,
                  simulation: T,
                  name: str,
-                 formula: FormulaInterface[T],
-                 depends: Sequence[Quantity[Any]] = [],
-                 origin: Quantity[Any] | None = None,
+                 formula: FormulaInterface[T, f64array],
+                 depends: Sequence[Quantity[Any, f64any]] = [],
+                 origin: Quantity[Any, f64array] | None = None,
                  scale: float = 1.0,
                  shaftwidth: float = 0.1,
                  color: vector = color.white,
@@ -222,8 +228,23 @@ class RigidBodyVPythonSimulation:
             return self.quantities[name].value
         else:
             raise ValueError(f"Quantity '{name}' not found.")
+        
+    def quantity(self, name: str) -> Quantity[Any, f64any]:
+        """
+        Get the quantity object by its name.
 
-    def add_quantity[T](self, quantity: Quantity[T]) -> Quantity[T]:
+        Parameters:
+        - name: Name of the quantity
+
+        Returns:
+        - Quantity object
+        """
+        if name in self.quantities:
+            return self.quantities[name]
+        else:
+            raise ValueError(f"Quantity '{name}' not found.")
+
+    def add_quantity[T, R: f64any](self, quantity: Quantity[T, R]) -> Quantity[T, R]:
         """
         Add a quantity to the simulation.
 
@@ -285,7 +306,7 @@ class RigidBodyVPythonSimulation:
                           scale=self.arrow_scale))
         ke_q = self.add_quantity(
             Quantity(self.sim, "kinetic_energy", lambda sim,
-                     deps: 0.5 * sim.body.w @ sim.body.I @ sim.body.w))
+                     deps: float(0.5 * sim.body.w @ sim.body.I @ sim.body.w)))
 
 
         orientation_arrow = self.add_quantity(
@@ -306,6 +327,17 @@ class RigidBodyVPythonSimulation:
                           color=color.cyan,
                           scale=self.arrow_scale,
                           shaftwidth=0.1))
+        
+        flight_frame_e1 = self.add_quantity(
+            ArrowQuantity(self.sim, "flight_frame_e1", lambda sim, deps: sim.inertial.flight_frame_e1,
+                          color=color.orange,
+                          scale=self.arrow_scale,
+                          shaftwidth=0.01))
+        
+        angle_of_attack = self.add_quantity(
+            Quantity(self.sim, "angle_of_attack",
+                     lambda sim, deps: sim.flight.alpha * 180.0/np.pi))
+        
 
         # Reference environment
 
@@ -395,16 +427,17 @@ class RigidBodyVPythonSimulation:
         self.object.update(R)
 
         text_pieces = [
-            f"Angular Momentum: {self['angular_momentum'][0]:.2f}, {self['angular_momentum'][1]:.2f}, {self['angular_momentum'][2]:.2f}\n"
-            f"Angular Velocity: {self['angular_velocity'][0]:.2f}, {self['angular_velocity'][1]:.2f}, {self['angular_velocity'][2]:.2f}\n"
-            f"Torque: {self['input_torque'][0]:.2f}, {self['input_torque'][1]:.2f}, {self['input_torque'][2]:.2f}\n"
-            f"Kinetic Energy: {self['kinetic_energy']:.2f}\n"
+            f"{self.quantity('angular_momentum')}",
+            f"{self.quantity('angular_velocity')}",
+            f"{self.quantity('input_torque')}",
+            f"{self.quantity('kinetic_energy')}",
+            f"{self.quantity('angle_of_attack')} deg",
             f"Camera Position: {scene.camera.pos.x:.2f}, {scene.camera.pos.y:.2f}, {scene.camera.pos.z:.2f}\n"
             f"Camera Up: {scene.camera.up.x:.2f}, {scene.camera.up.y:.2f}, {scene.camera.up.z:.2f}\n"
             f"Camera Axis: {scene.camera.axis.x:.2f}, {scene.camera.axis.y:.2f}, {scene.camera.axis.z:.2f}\n"
         ]
 
-        self.top_left_text.text = ''.join(text_pieces)
+        self.top_left_text.text = '\n'.join(text_pieces)
 
     def update_camera(self, dt):
         """
