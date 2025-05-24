@@ -84,7 +84,7 @@ class FrisbeeStaticValues:
     """
 
 
-    I: f64array
+    I: f64array = field(default_factory=lambda: np.diag([0.01, 0.01, 0.01]))  # Default to a diagonal matrix with small values
     '''
     Moment of inertia of the frisbee in the body frame.
     '''
@@ -122,6 +122,9 @@ class FrisbeeSimulation:
     all physical quantities should be derivable from the state of this class.
     '''
 
+
+
+
     def __init__(self, I: f64array, q0: f64array, omega0: f64array, velocity0: f64array| None=None):
         """
         Initialize the rigid body simulation.
@@ -134,24 +137,37 @@ class FrisbeeSimulation:
         """
         # Fixed quantities
 
-        self.static: Final[FrisbeeStaticValues] = FrisbeeStaticValues(I=I)
-
+        self.static: Final[FrisbeeStaticValues] = FrisbeeStaticValues()
         # Initial state
-        self.state: Final[FrisbeeState] = FrisbeeState(
-            q=q0 / np.linalg.norm(q0), # Normalize orientation quaternion
-            w=omega0,
-            v=velocity0 if velocity0 is not None else np.zeros(3, dtype=f64)
-        )
+        self.state: Final[FrisbeeState] = FrisbeeState()
+        # Computation cache
         self.cache: Final[FrisbeeComputationCache] = FrisbeeComputationCache()
 
-        # obtain initial cache values
-        self.state_derivative(self.state, cache=True)
-
+        self.set_state(I, q0, omega0, velocity0)
 
         # Frame views
         self.body = BodyFrameFrisbee(self.state, self.static, self.cache)
         self.inertial = InertialFrameFrisbee(self.state, self.static, self.cache)
         # self.aerodynamic = AerodynamicFrameFrisbee(self)
+
+    def set_state(self, I: f64array, q0: f64array, omega0: f64array, velocity0: f64array| None=None):
+        """
+        Set the initial state of the simulation.
+
+        Parameters:
+        - I: Moments of inertia (3x3 diagonal matrix)
+        - q0: Initial orientation quaternion (4x1 array)
+        - omega0: Initial angular velocity in body frame (3x1 array)
+        - velocity0: Initial velocity in inertial frame (3x1 array)
+        """
+        self.static.I = I
+        self.state.q = q0 / np.linalg.norm(q0)
+        self.state.w = omega0
+        self.state.v = velocity0 if velocity0 is not None else np.zeros(3, dtype=f64)
+
+        # obtain initial cache values
+        _ = self.state_derivative(self.state, cache=True)
+
 
     def set_control(self, torque=None, force=None):
         """

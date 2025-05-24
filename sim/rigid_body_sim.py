@@ -221,7 +221,16 @@ class RigidBodyVPythonSimulation:
         if quantity.name in self.quantities:
             raise ValueError(f"Quantity with name {quantity.name} already exists.")
         self.quantities[quantity.name] = quantity
+    
+
+    def reset(self):
+        """
+        Reset the simulation to its initial state.
+        """
+        omega0 = np.linalg.inv(self.object.InertiaTensor) @ self.momentum0
+        self.sim.set_state(self.object.InertiaTensor, self.q0, omega0, self.v0)
         
+
     def __init__(self, obj, q0, momentum):
         """
         Initialize the VPython visualization for the rigid body simulation.
@@ -232,6 +241,13 @@ class RigidBodyVPythonSimulation:
         - omega0: Initial angular velocity in body frame (3x1 array)
         - dt: Time step for the simulation
         """
+
+        self.q0 = np.copy(q0)
+        self.momentum0 = np.copy(momentum)
+        self.v0 = np.array([1.0, 0.0, 0.0])  # Initial linear velocity
+
+
+
         self.object = obj
         I = obj.InertiaTensor
         omega0 = np.linalg.inv(I) @ momentum
@@ -446,6 +462,10 @@ class RigidBodyVPythonSimulation:
             self.mouse_focus = not self.mouse_focus
         if event.key == 'p':
             self.running = not self.running
+
+        if event.key == 'r':
+            self.reset()
+
         
     def handle_mouse(self, event):
         """
