@@ -1,10 +1,128 @@
+from dataclasses import dataclass, field
+from typing import Callable
 import numpy as np
 
 from sim.math import Quaternion
+from .header import *
+from functools import cached_property
+
+@dataclass
+class FrisbeeState:
+    """
+    A class representing the state of the frisbee simulation.
+    This class holds the current orientation quaternion and angular velocity.
+    """
+    q: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0, 0.0, 0.0], dtype=f64))  # Default to identity quaternion
+    w: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=f64))  # Angular velocity in body frame
+    v: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=f64))  # Velocity in inertial frame
+
+    def __add__(self, other: Self) -> Self:
+        """
+        Add two FrisbeeState objects together.
+        """
+        return self.__class__(
+            q=self.q + other.q,
+            w=self.w + other.w,
+            v=self.v + other.v
+        )
+
+    def __sub__(self, other: Self) -> Self:
+        """
+        Subtract two FrisbeeState objects.
+        """
+        return self.__class__(
+            q=self.q - other.q,
+            w=self.w - other.w,
+            v=self.v - other.v
+        )
+    
+    def __mul__(self, scalar: float) -> Self:
+        """
+        Multiply the state by a scalar.
+        """
+        return self.__class__(
+            q=self.q * scalar,
+            w=self.w * scalar,
+            v=self.v * scalar
+        )
+    
+    def __iadd__(self, other: Self) -> Self:
+        """
+        In-place addition of two FrisbeeState objects.
+        """
+        self.q += other.q
+        self.w += other.w
+        self.v += other.v
+        return self
+    
+    def __isub__(self, other: Self) -> Self:
+        """
+        In-place subtraction of two FrisbeeState objects.
+        """
+        self.q -= other.q
+        self.w -= other.w
+        self.v -= other.v
+        return self
+    
+    def __imul__(self, scalar: float) -> Self:
+        """
+        In-place multiplication of the state by a scalar.
+        """
+        self.q *= scalar
+        self.w *= scalar
+        self.v *= scalar
+        return self
+    
+    __rmul__ = __mul__
+    __radd__ = __add__
+
+@dataclass
+class FrisbeeStaticValues:
+    """
+    A class representing any simulation values that are not determined by the evolution equation.
+    These can represent constants or externally driven variables.
+    """
 
 
-class RigidBodySimulation:
-    def __init__(self, I, q0, omega0):
+    I: f64array
+    '''
+    Moment of inertia of the frisbee in the body frame.
+    '''
+    g: float = 9.81
+
+    # Driven variables
+    T_ext: f64array = field(default_factory=lambda: np.zeros(3, dtype=f64))
+    F_ext: f64array = field(default_factory=lambda: np.zeros(3, dtype=f64))
+
+
+    @cached_property
+    def I_inv(self) -> f64array:
+        """
+        Inverse of the moment of inertia matrix.
+        This is computed as the inverse of the diagonal matrix I.
+        """
+        return np.linalg.inv(self.I)  # type: ignore
+
+
+@dataclass
+class FrisbeeComputationCache:
+    """
+    A class to hold computed values that can be reused in the simulation.
+    This is useful for caching intermediate results to avoid redundant calculations.
+    """
+    derivative: FrisbeeState = field(default_factory=FrisbeeState)
+    T_flutter: f64array = field(default_factory=lambda: np.zeros(3, dtype=f64))
+    w_inertial: f64array = field(default_factory=lambda: np.zeros(3, dtype=f64))
+
+
+class FrisbeeSimulation:
+    '''
+    A physical simulation of a frisbee.
+    This class can be thought of as the core physics engine for the frisbee simulation
+    all physical quantities should be derivable from the state of this class.
+    '''
+
+    def __init__(self, I: f64array, q0: f64array, omega0: f64array, velocity0: f64array| None=None):
         """
         Initialize the rigid body simulation.
 
@@ -14,73 +132,301 @@ class RigidBodySimulation:
         - omega0: Initial angular velocity in body frame (3x1 array)
         - dt: Time step for the simulation
         """
-        self.I = I
-        self.I_inv = np.linalg.inv(I)
-        # State variables
-        self.q = q0 / np.linalg.norm(q0)  # Normalize orientation quaternion
-        self.omega = omega0  # angular velocity in body frame
+        # Fixed quantities
 
-    def external_torque(self, t):
+        self.static: Final[FrisbeeStaticValues] = FrisbeeStaticValues(I=I)
+
+        # Initial state
+        self.state: Final[FrisbeeState] = FrisbeeState(
+            q=q0 / np.linalg.norm(q0), # Normalize orientation quaternion
+            w=omega0,
+            v=velocity0 if velocity0 is not None else np.zeros(3, dtype=f64)
+        )
+        self.cache: Final[FrisbeeComputationCache] = FrisbeeComputationCache()
+
+        # obtain initial cache values
+        self.state_derivative(self.state, cache=True)
+
+
+        # Frame views
+        self.body = BodyFrameFrisbee(self.state, self.static, self.cache)
+        self.inertial = InertialFrameFrisbee(self.state, self.static, self.cache)
+        # self.aerodynamic = AerodynamicFrameFrisbee(self)
+
+    def set_control(self, torque=None, force=None):
         """
-        Define external torque as a function of time.
-        Override this method to specify custom torque.
+        Set the external inputs for the simulation.
+
+        Parameters:
+        - torque: External torque in inertial frame (3x1 array)
+        - force: External force in inertial frame (3x1 array)
         """
-        return np.array([0.0, 0.0, 0.0])
+        if torque is not None:
+            self.static.T_ext = torque
+        if force is not None:
+            self.static.F_ext = force
+
+    def state_derivative(self, state: FrisbeeState, cache: bool = False) -> FrisbeeState:
+
+        orientation = Quaternion.rotate(state.q, np.array([0.0, 1.0, 0.0]))
+        w_inertial = Quaternion.rotate(state.q, state.w)
+        T_flutter_coefficient = 0.1
+        T_flutter = orientation * (w_inertial @ orientation) - w_inertial
+        T_flutter = T_flutter * np.linalg.norm(T_flutter) * T_flutter_coefficient
+
+        T_net = T_flutter + self.static.T_ext
+
+        deriv = FrisbeeState(
+            w=self.static.I_inv @ (Quaternion.rotate(Quaternion.conjugate(state.q), T_net) - np.cross(state.w, self.static.I @ state.w)),
+            q=Quaternion.angvel_to_deriv(state.q, state.w),
+            v=state.v  # Assuming no acceleration for now
+        )
+        if cache:
+            self.cache.derivative = deriv
+            self.cache.T_flutter = T_flutter
+            self.cache.w_inertial = w_inertial
+
+        return deriv
+        
 
 
-    def update(self, dt, torque=None):
+    def normalize_state(self):
+        """
+        Normalize the current state to match constraints of the simulation.
+        """
+        self.state.q /= np.linalg.norm(self.state.q)
+
+
+
+
+    @staticmethod
+    def RK4_step(state: FrisbeeState, dt: float, deriv_func: Callable[Concatenate[FrisbeeState, ...], FrisbeeState]) -> None:
+        """
+        Perform a single RK4 step to evolve the simulation state in-place
+
+        Parameters:
+        - state: Current state of the simulation
+        - dt: Time step for the simulation
+        - deriv_func: Function to compute the derivative of the state
+
+        Returns:
+        - new_state: New state after the RK4 step
+        """
+        k1 = deriv_func(state, cache=True)
+        k2 = deriv_func(state + (dt / 2) * k1)
+        k3 = deriv_func(state + (dt / 2) * k2)
+        k4 = deriv_func(state + dt * k3)
+
+        state += (dt / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+    
+    def evolve(self, dt):
         """
         Perform a single RK4 step to evolve the simulation.
 
         Parameters:
         - t: Current time
         """
-        torque = torque if torque is not None else np.empty(3)
+        # # Calculate total torque and force
+        # torque = self.constants.T_ext
+
+        # Update the state in-place using RK4
+        self.RK4_step(self.state, dt, self.state_derivative)
         
-        def omega_dot(omega):
-            return self.I_inv @ (Quaternion.rotate(Quaternion.conjugate(self.q), torque) - np.cross(omega, self.I @ omega))
+        # Normalize state
+        self.normalize_state()
 
-        def q_dot(q, omega):
-            return Quaternion.angvel_to_deriv(q, omega)
+@dataclass
+class BodyFrameFrisbee:
+    '''
+    A class representing the body frame of the frisbee.
+    This is a fixed coordinate system that moves with the frisbee.
+    '''
+    state: FrisbeeState
+    static: FrisbeeStaticValues
+    cache: FrisbeeComputationCache
+
+    @property
+    def I(self):
+        '''
+        The moment of inertia of the frisbee in the body frame.
+        This is a 3x3 diagonal matrix.
+        '''
+        return self.static.I
+
+    @property
+    def L(self):
+        '''
+        The angular momentum of the frisbee in the body frame.
+        This is a 3x1 vector.
+        '''
+        return self.static.I @ self.state.w
+    @property
+    def w(self):
+        '''
+        The angular velocity of the frisbee in the body frame.
+        This is a 3x1 vector.
+        '''
+        return self.state.w
+    
+    @property
+    def w_dot(self):
+        '''
+        The angular acceleration of the frisbee in the body frame.
+        This is a 3x1 vector.
+        '''
+        return self.static.I_inv @ (np.cross(self.w, self.L))
+    
+    @property
+    def v(self):
+        '''
+        The velocity of the frisbee in the body frame.
+        This is a 3x1 vector.
+        '''
+        return Quaternion.rotate(Quaternion.conjugate(self.state.q), self.state.v)
+    
+    @property
+    def q(self):
+        """
+        Get the orientation quaternion of the frisbee in the body frame. This is always the vector [1, 0, 0, 0] since the body frame is aligned with the frisbee's orientation.
+        """
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=f64)  # Identity quaternion for body frame
+    
+
+@dataclass
+class InertialFrameFrisbee:
+    '''
+    A class representing the inertial frame of the frisbee.
+    This is a fixed coordinate system that does not move with the frisbee.
+    '''
+    state: FrisbeeState
+    static: FrisbeeStaticValues
+    cache: FrisbeeComputationCache
+        
+    @property
+    def L(self):
+        '''
+        The angular momentum of the frisbee in the inertial frame.
+        This is a 3x1 vector.
+        '''
+        return Quaternion.rotate(self.state.q, self.static.I @ self.state.w)
+    
+    @property
+    def w(self):
+        '''
+        The angular velocity of the frisbee in the inertial frame.
+        This is a 3x1 vector.
+        '''
+        return Quaternion.rotate(self.state.q, self.state.w)
+    
+    @property
+    def w_dot(self):
+        '''
+        The angular acceleration of the frisbee in the inertial frame.
+        This is a 3x1 vector.
+        '''
+        return Quaternion.rotate(self.state.q, self.cache.derivative.w)
+    
+
+    @property
+    def v(self):
+        '''
+        The velocity of the frisbee in the inertial frame.
+        This is a 3x1 vector.
+        '''
+        return self.state.v
+    
+    @property
+    def T_flutter(self):
+        '''
+        The flutter torque of the frisbee in the inertial frame.
+        This is a 3x1 vector.
+        '''
+        return self.cache.T_flutter
+    
+    @property
+    def q(self):
+        """
+        Get the orientation quaternion of the frisbee in the inertial frame.
+
+        Returns:
+        - q: Orientation quaternion (4x1 array)
+        """
+        return self.state.q
+
+    @property
+    def T_net(self):
+        """
+        Get the net torque acting on the frisbee in the inertial frame.
+
+        Returns:
+        - net_torque: Net torque (3x1 array)
+        """
+        return self.T_flutter + self.static.T_ext
+    
+# @dataclass
+# class AerodynamicFrameFrisbee:
+#     '''
+#     A class representing the velocity frame of the frisbee.
+#     This is a fixed coordinate system that moves with the frisbee.
+#     '''
+#     state: FrisbeeState
+#     constants: FrisbeeConstants
+#     cache: FrisbeeComputationCache
         
 
 
-        # RK4
-        k1_omega = omega_dot(self.omega)
-        k1_q = q_dot(self.q, self.omega)
+    
+#     def frame_quaternion(self):
+#         """
+#         Get the aerodynamic frame of the frisbee based on its velocity.
 
+#         Parameters:
+#         - velocity: Velocity vector (3x1 array)
 
-        omega_2 = self.omega + 0.5 * dt * k1_omega
-        k2_omega = omega_dot(omega_2)
-        k2_q = q_dot(self.q + 0.5 * dt * k1_q, omega_2)
+#         Returns:
+#         - R: Rotation matrix (3x3 array)
+#         """
+#         q  = self.parent.q
+#         velocity = self.parent.inertial.v
+#         if np.linalg.norm(velocity) < 1e-6:
+#             return q
+#         # Get v1 rotated into the body frame
+#         v1 = Quaternion.rotate(Quaternion.conjugate(q), velocity)
         
-        omega_3 = self.omega + 0.5 * dt * k2_omega
-        k3_omega = omega_dot(omega_3)
-        k3_q = q_dot(self.q + 0.5 * dt * k2_q, omega_3)
+#         cos_theta = v1[0]/(v1[0]**2 + v1[2]**2)**0.5
+#         # Rotate q around the d1 axis to align with the velocity vector
+#         return Quaternion.multiply(q, np.array([((1 + cos_theta)/2)**0.5, 0, ((1 - cos_theta)/2)**0.5, 0]))
 
-        omega_4 = self.omega + dt * k3_omega
-        k4_omega = omega_dot(omega_4)
-        k4_q = q_dot(self.q + dt * k3_q, omega_4)
-        
-        self.omega += (dt / 6.0) * (k1_omega + 2 * k2_omega + 2 * k3_omega + k4_omega)
-        self.q += (dt / 6.0) * (k1_q + 2 * k2_q + 2 * k3_q + k4_q)
-        self.q /= np.linalg.norm(self.q)  # Normalize quaternion
-
-
-    # def simulate(self, t_end):
-    #     """
-    #     Run the simulation until a specified end time.
-
-    #     Parameters:
-    #     - t_end: End time for the simulation
-
-    #     Returns:
-    #     - results: List of (time, quaternion, angular velocity) tuples
-    #     """
-    #     t = 0.0
-    #     results = []
-    #     while t < t_end:
-    #         results.append((t, self.q.copy(), self.omega.copy()))
-    #         self.update(t)
-    #         t += dt
-    #     return results
+#     @property
+#     def v(self):
+#         '''
+#         The velocity of the frisbee in the inertial frame.
+#         This is a 3x1 vector.
+#         '''
+#         return Quaternion.rotate(self.frame_quaternion(), self.parent.state.v)
+    
+#     @property
+#     def w(self):
+#         '''
+#         The angular velocity of the frisbee in the inertial frame.
+#         This is a 3x1 vector.
+#         '''
+#         return Quaternion.rotate(self.frame_quaternion(), self.parent._omega)
+    
+#     @property
+#     def w_dot(self):
+#         '''
+#         The angular acceleration of the frisbee in the inertial frame.
+#         This is a 3x1 vector.
+#         '''
+#         # Todo: this is not correct due to the fact that the frame is rotating
+#         return Quaternion.rotate(self.frame_quaternion(), self.parent.body.w_dot)
+    
+#     @property
+#     def L(self):
+#         '''
+#         The angular momentum of the frisbee in the inertial frame.
+#         This is a 3x1 vector.
+#         '''
+#         return Quaternion.rotate(self.frame_quaternion(), self.parent.body.L)
+    

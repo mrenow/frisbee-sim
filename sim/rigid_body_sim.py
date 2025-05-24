@@ -1,7 +1,8 @@
 import time
 from vpython import *
+from .header import *
 import numpy as np
-from sim.rigid_body import RigidBodySimulation
+from sim.rigid_body import FrisbeeSimulation
 from sim.math import Quaternion
 
 
@@ -13,6 +14,9 @@ class RigidBodyShape:
         [0.0, 1.0, 0.0],
         [0.0, 0.0, 1.0]
     ])
+
+    objects: list[standardAttributes]
+    orignal_params: list[dict[str, vector]]
     def __init__(self):
         ...
 
@@ -62,6 +66,10 @@ class DudeBro(RigidBodyShape):
         ]
 
 class Frisbee(RigidBodyShape):
+
+    '''
+    Represents the shape of a frisbee
+    '''
     def __init__(self, mass=2, radius=1.0):
         """
         Frisbee shape
@@ -84,9 +92,136 @@ class Frisbee(RigidBodyShape):
             for obj in self.objects
         ]
 
+        
+
+
+class FormulaInterface[T](Protocol):
+    def __call__(self, simulation: T, deps: dict[str, f64array], /) -> f64array:
+        ...
+        
+class Quantity[T]:
+    '''
+    A strategy of obtaining a quantity from the simulation
+    '''
+
+
+    def __init__(self, simulation: T, name: str, formula: FormulaInterface[T], depends: Sequence['Quantity'] = []):
+        self.name = name
+        self._simulation = simulation
+        self._formula = formula
+        self.value = formula(simulation, {d.name: d.value for d in depends})
+        self.depends: Set[Quantity] = set(depends)
+        self._needs_update = False
+
+    def pre_update(self):
+        if self._needs_update:
+            return
+        self._needs_update = True
+        for dep in self.depends:
+            dep._needs_update = True
+        
+    def update(self):
+        if self._needs_update:
+            self._needs_update = False
+            for dep in self.depends:
+                dep.update()
+            # Update the value using the formula
+            self.value = self._formula(self._simulation, {d.name: d.value for d in self.depends})
+
+    def __str__(self):
+        return f"{self.name}: {self.value}"
+
+class DirectQuantity(Quantity[Any]):
+    '''
+    A simulation vector quantity that is not dependent on a simulation or other quantities
+    this can be used as a constant value or an external variable.
+    '''
+    def __init__(self, name: str, initial_value: f64array):
+        self.name = name
+        self.value = initial_value
+        self.depends = set()
+        self._needs_update = False
+    
+    def set(self, value: f64array):
+        self.value = value
+        
+    def update(self):
+        pass
+
+class ArrowQuantity[T](Quantity[T]):
+    '''
+    A simulation vector quantity that is represented by an arrow
+    It's position may be derived via another quantity
+    '''
+
+    def __init__(self,
+        simulation: T,
+        name: str,
+        formula: FormulaInterface[T],
+        depends: Sequence[Quantity[Any]] = [],
+        origin: Quantity[Any] | None = None,
+        scale: float = 1.0,
+        shaftwidth: float = 0.1,
+        color: vector = color.white,
+):
+        super().__init__(simulation, name, formula, depends)
+        
+        self.origin = origin if origin is not None else DirectQuantity("origin", np.array([0,0,0]))
+        
+        self.scale = scale
+        pos = vector(*self.origin.value) 
+        self.arrow = arrow(pos=pos, axis=scale*vector(*self.value), shaftwidth=shaftwidth, color=color)
+
+
+
+    def update(self):
+        if self._needs_update:
+            self._needs_update = False
+            for dep in self.depends:
+                dep.update()
+            self.origin.update()
+            # Update the value using the formula
+            self.value = self._formula(self._simulation, {d.name: d.value for d in self.depends})
+            self.arrow.axis = vector(*self.value)
+            if isinstance(self.origin, ArrowQuantity):
+                pos = self.origin.arrow.axis + self.origin.arrow.pos
+            else:
+                pos = vector(*(self.origin.value if self.origin else [0,0,0]))
+            self.arrow.pos = pos
+
+
+
 
 
 class RigidBodyVPythonSimulation:
+
+    def __getitem__(self, name: str) -> f64array:
+        """
+        Get the value of a quantity by its name.
+
+        Parameters:
+        - name: Name of the quantity
+
+        Returns:
+        - value: Value of the quantity
+        """
+        if name in self.quantities:
+            return self.quantities[name].value
+        else:
+            raise ValueError(f"Quantity '{name}' not found.")
+
+
+    def add_quantity(self, quantity: Quantity[Any]):
+        """
+        Add a quantity to the simulation.
+
+        Parameters:
+        - quantity: An instance of the Quantity class
+        """
+        if quantity.name in self.quantities:
+            raise ValueError(f"Quantity with name {quantity.name} already exists.")
+        self.quantities[quantity.name] = quantity
+        
     def __init__(self, obj, q0, momentum):
         """
         Initialize the VPython visualization for the rigid body simulation.
@@ -100,38 +235,45 @@ class RigidBodyVPythonSimulation:
         self.object = obj
         I = obj.InertiaTensor
         omega0 = np.linalg.inv(I) @ momentum
-        self.simulation = RigidBodySimulation(I, q0, omega0)
-
+        self.sim = FrisbeeSimulation(I, q0, omega0, np.array([1.0, 0.0, 0.0]))
+        self.quantities: dict[str, Quantity] = {}
 
         # State quantities
         
-
-        self.body_torque = np.array([0.0, 0.0, 0.0])
-
-        self.inertial_torque = np.array([0.0, 0.0, 0.0])
+        self.input_torque = DirectQuantity("input_torque", np.array([0.0, 0.0, 0.0]))
+        self.add_quantity(self.input_torque)
         # Computed quantities
-        self.angular_momentum_intertial = Quaternion.rotate(q0, I @ omega0)
-        self.angular_velocity_intertial = Quaternion.rotate(q0, omega0)
-        self.kinetic_energy = 0.5 * omega0 @ I @ omega0
 
-
-        # initialize arrows and other objexcts
+        am_q = ArrowQuantity(self.sim, "angular_momentum", lambda sim, deps: Quaternion.rotate(sim.inertial.q, sim.body.I @ sim.body.w),
+                        color=color.blue,
+                        scale=2.0)
+        av_q = ArrowQuantity(self.sim, "angular_velocity", lambda sim, deps: Quaternion.rotate(sim.inertial.q, sim.body.w),
+                        color=color.yellow,
+                        scale=2.0)
+        ke_q = Quantity(self.sim, "kinetic_energy", lambda sim, deps: 0.5 * sim.body.w @ sim.body.I @ sim.body.w)
+    
         
+        self.add_quantity(am_q)
+        self.add_quantity(av_q)
+        self.add_quantity(ke_q)
+
         self.arrow_scale = 2.0
+
+        self.orientation_arrow = ArrowQuantity(self.sim, "orientation", lambda sim, deps: Quaternion.rotate(sim.inertial.q, np.array([0.0, 1.0, 0.0])),
+                        color=color.white,
+                        scale=self.arrow_scale,
+                        shaftwidth=0.1)
         
-        self.angular_velocity_arrow = arrow(pos=vector(0, 0, 0), axis=self.arrow_scale*vector(*self.angular_velocity_intertial), shaftwidth=0.1, color=color.yellow)
-        self.angular_momentum_arrow = arrow(pos=vector(0, 0, 0), axis=self.arrow_scale*vector(*self.angular_momentum_intertial), shaftwidth=0.1, color=color.blue)
+        self.add_quantity(self.orientation_arrow)
 
-        self.orientation_arrow = arrow(pos=vector(0, 0, 0), axis=self.arrow_scale*vector(*Quaternion.rotate(q0, np.array([0.0,1.0, 0.0]))), shaftwidth=0.1, color=color.white)
+        total_torque_arrow = ArrowQuantity(self.sim, "total_torque", lambda sim, deps: sim.inertial.T_net,
+                        origin=am_q,
+                        color=color.red,
+                        scale=self.arrow_scale,
+                        shaftwidth=0.1)
+        self.add_quantity(total_torque_arrow)
 
-        self.body_torque_arrow = arrow(pos=vector(0, 0, 0), axis=self.arrow_scale*vector(*Quaternion.rotate(q0, self.body_torque)), shaftwidth=0.1, color=color.green)
-
-
-        self.inertial_torque_arrow = arrow(pos=vector(0, 0, 0), axis=self.arrow_scale*vector(*self.inertial_torque), shaftwidth=0.1, color=color.red)
-
-        
-        self.total_torque = Quaternion.rotate(q0, self.body_torque) + self.inertial_torque
-
+        # Control inputs
 
 
         self.floor = box(pos=vector(0, -5, 0), axis=vector(1, 0, 0), length=100, height=0.1, width=100, color=color.white)
@@ -196,58 +338,37 @@ class RigidBodyVPythonSimulation:
         mag = 4
 
         if "l" in keysdown():
-            self.inertial_torque = mag* np.array([0.0, 0.0, 1.0])
+            self.input_torque.set(mag* np.array([0.0, 0.0, 1.0]))
         elif "j" in keysdown():
-            self.inertial_torque = mag* np.array([0.0, 0.0, -1.0])
+            self.input_torque.set(mag* np.array([0.0, 0.0, -1.0]))
         elif "i" in keysdown():
-            self.inertial_torque = mag* np.array([0.0, 1.0, 0.0])
+            self.input_torque.set(mag* np.array([0.0, 1.0, 0.0]))
         elif "k" in keysdown():
-            self.inertial_torque = mag* np.array([0.0, -1.0, 0.0])
+            self.input_torque.set(mag* np.array([0.0, -1.0, 0.0]))
         else:
-            self.inertial_torque = mag* np.array([0.0, 0.0, 0.0])
-        # self.inertial_torque = np.array([0.0, 0.0, 1.0])
-
-        orientation = Quaternion.rotate(self.simulation.q, np.array([0.0, 1.0, 0.0]))
-        flutter_torque_coefficient = 0.1
-        flutter_torque = orientation * (self.angular_velocity_intertial @ orientation) - self.angular_velocity_intertial 
-        flutter_torque = flutter_torque * np.linalg.norm(flutter_torque) * flutter_torque_coefficient
-
-        self.inertial_torque += flutter_torque  
-
-        self.total_torque = Quaternion.rotate(self.simulation.q, self.body_torque) + self.inertial_torque
+            self.input_torque.set(mag* np.array([0.0, 0.0, 0.0]))
 
     def update_quantities(self):
-        q = self.simulation.q
-        self.angular_momentum_intertial = Quaternion.rotate(q, self.simulation.I @ self.simulation.omega)
-        self.angular_velocity_intertial = Quaternion.rotate(q, self.simulation.omega)
-        self.kinetic_energy = 0.5 * self.simulation.omega @ self.simulation.I @ self.simulation.omega
-    
-        
+
+        for quantity in self.quantities.values():
+            quantity.pre_update()
+        for quantity in self.quantities.values():
+            quantity.update()        
     
     def update_graphics(self):
         # Get the current quaternion and angular velocity
-        q = self.simulation.q
+        q = self.sim.inertial.q
 
         # Convert quaternion to rotation matrix and apply to the body
         R = self.quaternion_to_vector_rotation(q)
         self.object.update(R)
 
 
-        self.angular_velocity_arrow.axis=self.arrow_scale*vector(*self.angular_velocity_intertial)
-        self.angular_momentum_arrow.axis=self.arrow_scale*vector(*self.angular_momentum_intertial)
-
-
-        self.body_torque_arrow.axis=self.arrow_scale*vector(*Quaternion.rotate(q, self.body_torque))
-        self.inertial_torque_arrow.axis=self.arrow_scale*vector(*self.inertial_torque)
-        self.body_torque_arrow.pos = self.angular_momentum_arrow.pos + self.angular_momentum_arrow.axis
-        self.inertial_torque_arrow.pos = self.angular_momentum_arrow.pos + self.angular_momentum_arrow.axis
-        self.orientation_arrow.axis=self.arrow_scale*vector(*Quaternion.rotate(q, np.array([0.0, 1.0, 0.0])))
-
         text_pieces = [
-            f"Angular Momentum: {self.angular_momentum_intertial[0]:.2f}, {self.angular_momentum_intertial[1]:.2f}, {self.angular_momentum_intertial[2]:.2f}\n" \
-            f"Angular Velocity: {self.angular_velocity_intertial[0]:.2f}, {self.angular_velocity_intertial[1]:.2f}, {self.angular_velocity_intertial[2]:.2f}\n" \
-            f"Torque: {self.total_torque[0]:.2f}, {self.total_torque[1]:.2f}, {self.total_torque[2]:.2f}\n" \
-            f"Kinetic Energy: {self.kinetic_energy:.2f}\n" \
+            f"Angular Momentum: {self['angular_momentum'][0]:.2f}, {self['angular_momentum'][1]:.2f}, {self['angular_momentum'][2]:.2f}\n" \
+            f"Angular Velocity: {self['angular_velocity'][0]:.2f}, {self['angular_velocity'][1]:.2f}, {self['angular_velocity'][2]:.2f}\n" \
+            f"Torque: {self['input_torque'][0]:.2f}, {self['input_torque'][1]:.2f}, {self['input_torque'][2]:.2f}\n" \
+            f"Kinetic Energy: {self['kinetic_energy']:.2f}\n" \
             f"Camera Position: {scene.camera.pos.x:.2f}, {scene.camera.pos.y:.2f}, {scene.camera.pos.z:.2f}\n" \
             f"Camera Up: {scene.camera.up.x:.2f}, {scene.camera.up.y:.2f}, {scene.camera.up.z:.2f}\n" \
             f"Camera Axis: {scene.camera.axis.x:.2f}, {scene.camera.axis.y:.2f}, {scene.camera.axis.z:.2f}\n" \
@@ -304,9 +425,9 @@ class RigidBodyVPythonSimulation:
             self.update_controls(t, dt)
             self.update_camera(dt)
             if self.running:
-
+                self.sim.set_control(torque=self['input_torque'])
                 # Step the simulation
-                self.simulation.update(dt, self.total_torque)
+                self.sim.evolve(dt)
                 self.update_quantities()
                 simtime += dt
                 
@@ -345,7 +466,7 @@ class RigidBodyVPythonSimulation:
 if __name__ == "__main__":
     # Example parameters
     q0 = np.array([1.0, 0.0, 0.0, 0.0])
-    amomentum = np.array([10.0, 0.0, 0])
+    amomentum = np.array([10.0, 3.0, 0])
 
     sim = RigidBodyVPythonSimulation(Frisbee(), q0, amomentum)
 
