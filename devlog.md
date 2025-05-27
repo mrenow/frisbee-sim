@@ -47,3 +47,11 @@ We can actually just analyse the stationary frisbee, and not actually move it wi
 
 ## May 23
 Added flutter torque. Appears to work well in most cases - gyroscopic stability & also rotational decay when the disc is rotating along it's intermediate axis.
+- Can we obtain a good analytical approximation for flutter torque based on air density?
+- Is this already included in the other torque coefficients?
+
+
+# May 26
+- Integrated forces, torques and velocity into the simulation & got stable flight working.
+- Debugging the simulation and got a new set of parameters from some other papers.
+- Rescaled all quantities to physically accurate sizes.

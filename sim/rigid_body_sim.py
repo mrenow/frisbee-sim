@@ -21,7 +21,7 @@ class RigidBodyShape:
     def __init__(self):
         ...
 
-    def update(self, R):
+    def update(self, R, x):
         """
         Update the position and orientation of the rigid body shape using their original positions.
 
@@ -33,6 +33,7 @@ class RigidBodyShape:
             obj.pos = R(initial_vectors['pos'])
             obj.axis = R(initial_vectors['axis'])
             obj.up = R(initial_vectors['up'])
+            obj.pos = vector(*x)
 
 
 class DudeBro(RigidBodyShape):
@@ -78,15 +79,12 @@ class Frisbee(RigidBodyShape):
     Represents the shape of a frisbee
     '''
 
-    def __init__(self, mass=2, radius=1.0):
+    def __init__(self, mass=2, radius=0.269/2):
         """
         Frisbee shape
         """
-        # Inertia of a thin disk
-        self.InertiaTensor = 0.5 * radius * \
-            radius * mass * np.diag([0.5, 1, 0.5])
 
-        depth = 0.1
+        depth = 0.005
         self.body = cylinder(pos=vector(
             0, -depth/2, 0), axis=vector(0, depth, 0), radius=radius, color=color.blue)
         self.xaxis = box(pos=vector(0, 0, 0), axis=vector(
@@ -214,6 +212,140 @@ class ArrowQuantity[T](Quantity[T, f64array]):
 
 class RigidBodyVPythonSimulation:
 
+
+    def __init__(self, obj: RigidBodyShape, q0, L, v0, I_alpha: float= 0.00197):
+        """
+        Initialize the VPython visualization for the rigid body simulation.
+
+        Parameters:
+        - I: Moments of inertia (3x3 diagonal matrix)
+        - q0: Initial orientation quaternion (4x1 array)
+        - omega0: Initial angular velocity in body frame (3x1 array)
+        - dt: Time step for the simulation
+        """
+
+        self.q0 = q0
+        self.L0 = L
+        self.v0 = v0  # Initial linear velocity
+
+        self.object = obj
+        self.sim = FrisbeeSimulation(q0, self.L0, self.v0)
+        self.quantities: dict[str, Quantity] = {}
+
+        # State quantities
+
+        self.input_torque = DirectQuantity(
+            "input_torque", np.array([0.0, 0.0, 0.0]))
+        self.add_quantity(self.input_torque)
+        # Computed quantities
+
+
+        self.arrow_scale = 1.0 * 0.05
+        self.angular_vel_scale = 0.5/np.pi * 0.05
+
+        pos_q = self.add_quantity(
+            Quantity(self.sim, "pos", lambda sim, deps: sim.state.x))
+        
+
+        av_q = self.add_quantity(
+            ArrowQuantity(self.sim, "angular_velocity", lambda sim, deps: Quaternion.rot(sim.inertial.q, sim.body.w),
+                          origin=pos_q,
+                          color=color.yellow,
+                          scale=self.angular_vel_scale,
+                          shaftwidth=0.01))
+
+        am_q = self.add_quantity(
+            ArrowQuantity(self.sim, "angular_momentum", lambda sim, deps: Quaternion.rot(sim.inertial.q, sim.body.I @ sim.body.w),
+                          origin=pos_q,
+                          color=color.blue,
+                          scale=self.angular_vel_scale/I_alpha,
+                          shaftwidth=0.01))
+        ke_q = self.add_quantity(
+            Quantity(self.sim, "kinetic_energy", lambda sim,
+                     deps: float(0.5 * sim.body.w @ sim.body.I @ sim.body.w)))
+
+        av_angle = self.add_quantity(
+            Quantity(self.sim, "av_angle", lambda sim,
+                     deps: np.arccos(deps['angular_velocity'] @ deps['angular_momentum']/ (np.linalg.norm(deps['angular_velocity']) *np.linalg.norm(deps['angular_momentum']))),
+                     depends=[av_q, am_q]))
+
+
+        orientation_arrow = self.add_quantity(
+            ArrowQuantity(self.sim, "orientation", lambda sim, deps: Quaternion.rot(sim.inertial.q, np.array([0.0, 1.0, 0.0])),
+                          origin=pos_q,
+                          color=color.white,
+                          scale=0.5,
+                          shaftwidth=0.003))
+
+        total_torque_arrow = self.add_quantity(
+            ArrowQuantity(self.sim, "total_torque", lambda sim, deps: sim.inertial.T_net,
+                          origin=am_q,
+                          color=color.red,
+                          scale=2,
+                          shaftwidth=0.01))
+
+        velocity_arrow = self.add_quantity(
+            ArrowQuantity(self.sim, "velocity", lambda sim, deps: Quaternion.rot(sim.inertial.q, sim.body.v),
+                          origin=pos_q,
+                          color=color.cyan,
+                          scale=self.arrow_scale,
+                          shaftwidth=0.01))
+        
+        flight_frame_e1 = self.add_quantity(
+            ArrowQuantity(self.sim, "flight_frame_e1", lambda sim, deps: sim.inertial.flight_frame_e1,
+                          origin=pos_q,
+                          color=color.orange,
+                          scale=0.5,
+                          shaftwidth=0.003))
+        
+        angle_of_attack = self.add_quantity(
+            Quantity(self.sim, "angle_of_attack",
+                     lambda sim, deps: sim.flight.alpha * 180.0/np.pi))
+
+        lift_drag_force = self.add_quantity(
+            ArrowQuantity(self.sim, "lift_drag_force", lambda sim, deps: sim.inertial.lift_drag_force,
+                          origin=velocity_arrow,
+                          color=color.magenta,
+                          scale=self.arrow_scale,
+                          shaftwidth=0.01))
+        
+
+        # Reference environment
+
+        self.floor = box(pos=vector(0, -1, 0), axis=vector(1, 0, 0),
+                         length=100, height=0.1, width=100, color=color.white)
+        self.axis_x = arrow(pos=vector(
+            0, -1, 0), axis=vector(100, 0, 0), shaftwidth=0.1, color=color.red)
+        self.axis_z = arrow(pos=vector(
+            0, -1, 0), axis=vector(0, 0, 100), shaftwidth=0.1, color=color.green)
+
+        # Text overlay
+
+        self.top_left_text = label(
+            pos=vector(-10, 20, -10), text="Angular Velocity", height=20, border=4)
+
+        # Controls
+        self.mouse_focus = False
+        self.running = True
+        self.keymap = {}
+        self.speed = 1.0  # Simulation speed factor
+
+        # Set movable camera
+
+        scene.camera.pos = vector(-0.1, 0, 0)
+        scene.camera.axis = vector(0.1, 0, 0)
+        scene.width = 1800
+        scene.height = 900
+        scene.autoscale = False
+        scene.background = vector(0.5, 0.5, 0.5)
+        scene.range = 5
+        scene.center = vector(0, 0, 0)
+
+        scene.bind('keydown', self.handle_input)
+        scene.bind('mousemove', self.handle_mouse)
+
+
+
     def __getitem__(self, name: str) -> f64array:
         """
         Get the value of a quantity by its name.
@@ -261,116 +393,7 @@ class RigidBodyVPythonSimulation:
         """
         Reset the simulation to its initial state.
         """
-        omega0 = np.linalg.inv(self.object.InertiaTensor) @ self.L0
-        self.sim.set_state(self.object.InertiaTensor, self.q0, omega0, self.v0)
-
-    def __init__(self, obj, q0, L):
-        """
-        Initialize the VPython visualization for the rigid body simulation.
-
-        Parameters:
-        - I: Moments of inertia (3x3 diagonal matrix)
-        - q0: Initial orientation quaternion (4x1 array)
-        - omega0: Initial angular velocity in body frame (3x1 array)
-        - dt: Time step for the simulation
-        """
-
-        self.q0 = np.copy(q0)
-        self.L0 = np.copy(L)
-        self.v0 = np.array([1.0, 0.0, 0.0])  # Initial linear velocity
-
-        self.object = obj
-        I = obj.InertiaTensor
-        self.sim = FrisbeeSimulation(I, q0, self.L0, np.array([1.0, 0.0, 0.0]))
-        self.quantities: dict[str, Quantity] = {}
-
-        # State quantities
-
-        self.input_torque = DirectQuantity(
-            "input_torque", np.array([0.0, 0.0, 0.0]))
-        self.add_quantity(self.input_torque)
-        # Computed quantities
-
-
-        self.arrow_scale = 2.0
-
-
-        av_q = self.add_quantity(
-            ArrowQuantity(self.sim, "angular_velocity", lambda sim, deps: Quaternion.rot(sim.inertial.q, sim.body.w),
-                          color=color.yellow,
-                          scale=self.arrow_scale))
-
-        am_q = self.add_quantity(
-            ArrowQuantity(self.sim, "angular_momentum", lambda sim, deps: Quaternion.rot(sim.inertial.q, sim.body.I @ sim.body.w),
-                          color=color.blue,
-                          scale=self.arrow_scale))
-        ke_q = self.add_quantity(
-            Quantity(self.sim, "kinetic_energy", lambda sim,
-                     deps: float(0.5 * sim.body.w @ sim.body.I @ sim.body.w)))
-
-
-        orientation_arrow = self.add_quantity(
-            ArrowQuantity(self.sim, "orientation", lambda sim, deps: Quaternion.rot(sim.inertial.q, np.array([0.0, 1.0, 0.0])),
-                          color=color.white,
-                          scale=self.arrow_scale,
-                          shaftwidth=0.01))
-
-        total_torque_arrow = self.add_quantity(
-            ArrowQuantity(self.sim, "total_torque", lambda sim, deps: sim.inertial.T_net,
-                          origin=am_q,
-                          color=color.red,
-                          scale=self.arrow_scale,
-                          shaftwidth=0.04))
-
-        velocity_arrow = self.add_quantity(
-            ArrowQuantity(self.sim, "velocity", lambda sim, deps: Quaternion.rot(sim.inertial.q, sim.body.v),
-                          color=color.cyan,
-                          scale=self.arrow_scale,
-                          shaftwidth=0.1))
-        
-        flight_frame_e1 = self.add_quantity(
-            ArrowQuantity(self.sim, "flight_frame_e1", lambda sim, deps: sim.inertial.flight_frame_e1,
-                          color=color.orange,
-                          scale=self.arrow_scale,
-                          shaftwidth=0.01))
-        
-        angle_of_attack = self.add_quantity(
-            Quantity(self.sim, "angle_of_attack",
-                     lambda sim, deps: sim.flight.alpha * 180.0/np.pi))
-        
-
-        # Reference environment
-
-        self.floor = box(pos=vector(0, -5, 0), axis=vector(1, 0, 0),
-                         length=100, height=0.1, width=100, color=color.white)
-        self.axis_x = arrow(pos=vector(
-            0, -5, 0), axis=vector(100, 0, 0), shaftwidth=0.1, color=color.red)
-        self.axis_z = arrow(pos=vector(
-            0, -5, 0), axis=vector(0, 0, 100), shaftwidth=0.1, color=color.green)
-
-        # Text overlay
-
-        self.top_left_text = label(
-            pos=vector(-10, 20, -10), text="Angular Velocity", height=20, border=4)
-
-        # Controls
-        self.mouse_focus = False
-        self.running = True
-        self.keymap = {}
-
-        # Set movable camera
-
-        scene.camera.pos = vector(0, 0, 5)
-        scene.camera.axis = vector(0, 0, -5)
-        scene.width = 1800
-        scene.height = 900
-        scene.autoscale = False
-        scene.background = vector(0.5, 0.5, 0.5)
-        scene.range = 5
-        scene.center = vector(0, 0, 0)
-
-        scene.bind('keydown', self.handle_input)
-        scene.bind('mousemove', self.handle_mouse)
+        self.sim.set_state(self.q0, self.L0, self.v0, None)
 
     def quaternion_to_vector_rotation(self, q):
         """
@@ -424,7 +447,7 @@ class RigidBodyVPythonSimulation:
 
         # Convert quaternion to rotation matrix and apply to the body
         R = self.quaternion_to_vector_rotation(q)
-        self.object.update(R)
+        self.object.update(R, self.sim.state.x)
 
         text_pieces = [
             f"{self.quantity('angular_momentum')}",
@@ -432,9 +455,11 @@ class RigidBodyVPythonSimulation:
             f"{self.quantity('input_torque')}",
             f"{self.quantity('kinetic_energy')}",
             f"{self.quantity('angle_of_attack')} deg",
+            f"{self.quantity('av_angle')} deg",
             f"Camera Position: {scene.camera.pos.x:.2f}, {scene.camera.pos.y:.2f}, {scene.camera.pos.z:.2f}\n"
             f"Camera Up: {scene.camera.up.x:.2f}, {scene.camera.up.y:.2f}, {scene.camera.up.z:.2f}\n"
             f"Camera Axis: {scene.camera.axis.x:.2f}, {scene.camera.axis.y:.2f}, {scene.camera.axis.z:.2f}\n"
+            f"Speed factor: {self.speed:.2f}\n"
         ]
 
         self.top_left_text.text = '\n'.join(text_pieces)
@@ -443,7 +468,7 @@ class RigidBodyVPythonSimulation:
         """
         Update the camera position and orientation based on user input.
         """
-        speed = 8
+        speed = 15
         keylist = keysdown()
         if 'a' in keylist:
             vec = cross(scene.camera.axis, scene.camera.up)
@@ -476,9 +501,9 @@ class RigidBodyVPythonSimulation:
         t = time.time()
         simtime = 0
         while t_end < 0 or t < t_end:
-            rate(200)  # Limit the simulation to 100 frames per second
+            rate(100)  # Limit the simulation to 100 frames per second
 
-            dt = time.time() - t
+            dt = (time.time() - t) * self.speed
             self.update_controls(t, dt)
             self.update_camera(dt)
             if self.running:
@@ -507,6 +532,11 @@ class RigidBodyVPythonSimulation:
         if event.key == 'r':
             self.reset()
 
+        if event.key == '-':
+            self.speed /= 1.1
+        if event.key == '=':
+            self.speed *= 1.1
+
     def handle_mouse(self, event):
         """
         Mouse movement will be captured and used to rotate the camera 
@@ -528,9 +558,29 @@ class RigidBodyVPythonSimulation:
 
 if __name__ == "__main__":
     # Example parameters
-    q0 = np.array([1.0, 0.0, 0.0, 0.0])
-    L_inertial = np.array([10.0, 3.0, 0])  # Initial angular momentum
+    alpha = 0
 
-    sim = RigidBodyVPythonSimulation(Frisbee(), q0, L_inertial)
+    rotation_angle  = -np.pi *0.7 # Rotation angle in radians
+    rotation_axis = np.array([1, 0.0, 0.30])  # Axis of rotation
+    rotation_axis = rotation_axis / np.linalg.norm(rotation_axis)  # Normalize the axis
+
+    rotation_quat = np.array([
+        np.cos(rotation_angle / 2),
+        rotation_axis[0] * np.sin(rotation_angle / 2),
+        rotation_axis[1] * np.sin(rotation_angle / 2),
+        rotation_axis[2] * np.sin(rotation_angle / 2)
+    ])  # Quaternion representing the rotation
+
+    
+
+    q0 = np.array([1,0,0,0], dtype=f64)  # Initial orientation quaternion
+    L_inertial = 80*np.array([0, 1, 0]) *0.00197   # Initial angular momentum
+    v = 10* np.array([1, -0.2, 2])  # Initial linear velocity
+
+    q0 = Quaternion.mul(rotation_quat, q0)  # Apply rotation to the initial quaternion
+    L_inertial = Quaternion.rot(q0, L_inertial) + 6*np.array([-3, 0, 0])* 0.00197  # Rotate the initial angular momentum
+    v = Quaternion.rot(q0, v)  # Rotate the initial linear velocity
+
+    sim = RigidBodyVPythonSimulation(Frisbee(), q0, L_inertial, v)
 
     sim.run(-1)

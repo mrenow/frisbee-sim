@@ -1,7 +1,9 @@
 from .header import *
 
 
+
 class Quaternion:
+
     @staticmethod
     def angvel_to_deriv(q: f64array, omega: f64array) -> f64array:
         """
@@ -16,7 +18,9 @@ class Quaternion:
         """
         omega_quat = np.array([0.0, omega[0], omega[1], omega[2]])
         dq = 0.5 * Quaternion.mul(q, omega_quat)
+
         return dq
+    
     @staticmethod
     def mul(q1: f64array, q2: f64array) -> f64array:
         """
