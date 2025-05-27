@@ -2,8 +2,8 @@ import time
 from vpython import *
 from .header import *
 import numpy as np
-from sim.rigid_body import FrisbeeSimulation
-from sim.math import Quaternion
+from sim.model.frisbee import FrisbeeSimulation
+from sim.model.math import Quaternion
 
 np.set_printoptions(formatter={'float': '{: 0.3f}'.format})
 
@@ -266,7 +266,7 @@ class RigidBodyVPythonSimulation:
 
         av_angle = self.add_quantity(
             Quantity(self.sim, "av_angle", lambda sim,
-                     deps: np.arccos(deps['angular_velocity'] @ deps['angular_momentum']/ (np.linalg.norm(deps['angular_velocity']) *np.linalg.norm(deps['angular_momentum']))),
+                     deps:180.0/np.pi * np.arccos(deps['angular_velocity'] @ deps['angular_momentum']/ (np.linalg.norm(deps['angular_velocity']) *np.linalg.norm(deps['angular_momentum']))),
                      depends=[av_q, am_q]))
 
 
@@ -560,7 +560,7 @@ if __name__ == "__main__":
     # Example parameters
     alpha = 0
 
-    rotation_angle  = -np.pi *0.7 # Rotation angle in radians
+    rotation_angle  = -np.pi *0.0 # Rotation angle in radians
     rotation_axis = np.array([1, 0.0, 0.30])  # Axis of rotation
     rotation_axis = rotation_axis / np.linalg.norm(rotation_axis)  # Normalize the axis
 
@@ -575,7 +575,7 @@ if __name__ == "__main__":
 
     q0 = np.array([1,0,0,0], dtype=f64)  # Initial orientation quaternion
     L_inertial = 80*np.array([0, 1, 0]) *0.00197   # Initial angular momentum
-    v = 10* np.array([1, -0.2, 2])  # Initial linear velocity
+    v = 10* np.array([1, 0, 2])  # Initial linear velocity
 
     q0 = Quaternion.mul(rotation_quat, q0)  # Apply rotation to the initial quaternion
     L_inertial = Quaternion.rot(q0, L_inertial) + 6*np.array([-3, 0, 0])* 0.00197  # Rotate the initial angular momentum

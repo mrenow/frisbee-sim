@@ -2,8 +2,8 @@ from dataclasses import dataclass, field
 from typing import Callable
 import numpy as np
 
-from sim.math import Quaternion
-from .header import *
+from sim.model.math import Quaternion
+from ..header import *
 from functools import cached_property
 
 
@@ -122,7 +122,7 @@ class FrisbeeStaticValues:
     # Moment coefficients from lift and drag forces
     CM30: float = -0.01
     CM3alpha: float = 0.057
-    CM3alpha_dot: float = 0.0025
+    CM3alpha_dot: float = 0.0025  # This is an angle of attack damping effect. I think this might be captured by the flutter already. Not sure.
 
     # Moment coefficients due to the rolling magnus moment
     CM1gamma: float = 0.006
@@ -131,7 +131,8 @@ class FrisbeeStaticValues:
     CM2Nr: float = 0.000034
 
     # Coefficient of drag due to flutter
-    C_flutter: float = 0.03
+    C_flutter_plus: float = 1 # Flutter coefficient for the top side of the frisbee. This should be a bit lower than the drag coefficient for a flat plate.
+    C_flutter_minus: float = 2.3 # Estimated as considerably higher than the linear drag coefficient for a flat plate perpendicular to flow.
 
     # Driven variables
     T_ext: f64array = field(default_factory=lambda: np.zeros(3, dtype=f64))
@@ -167,6 +168,45 @@ class FrisbeeStaticValues:
         Angle of attack at which the lift coefficient is zero.
         """
         return -self.Cl0 / self.Clalpha 
+
+
+    # The following properties just cache constant calculations for the simulation.
+    @cached_property
+    def C_flutter_torque(self) -> float:
+        return self.C_flutter_plus + self.C_flutter_minus
+    
+    @cached_property
+    def C_flutter_lift(self) -> float:
+        return self.C_flutter_plus - self.C_flutter_minus
+
+    @cached_property
+    def r2(self) -> float:
+        return self.radius ** 2
+    
+    @cached_property
+    def pi_r4_rho_C_flutter_lift_on_8(self) -> float:
+        return np.pi/8 * self.radius ** 4 * self.rho * self.C_flutter_lift
+    @cached_property
+    def r5_rho_C_flutter_torque_4_on_15(self) -> float:
+        return 4/15 * self.radius ** 5 * self.rho * self.C_flutter_torque 
+    
+    @cached_property
+    def rho_area(self) -> float:
+        return self.rho * self.area
+    
+    @cached_property
+    def rho_area_Cd_on_2(self) -> float:
+        return self.rho_area * self.Cd0 /2
+    
+    @cached_property
+    def rho_area_Cl_on_2(self) -> float:
+        return self.rho_area * self.Cl0 /2
+    
+    @cached_property
+    def rho_area_r(self) -> float:
+        return self.rho_area * self.radius
+    
+
 
 @dataclass
 class FrisbeeComputationCache:
@@ -260,12 +300,13 @@ class FrisbeeSimulation:
 
         w_body = self.static.I_inv @ L_body  # Angular velocity in body frame
 
-        orientation = Quaternion.rot(state.q, np.array([0.0, 1.0, 0.0]))
-
-        w_inertial = Quaternion.rot(state.q, w_body)
-        T_flutter = orientation * (w_inertial @ orientation) - w_inertial
-        T_flutter = self.static.area * self.static.radius**2 * self.static.rho * T_flutter * \
-            np.linalg.norm(T_flutter) * self.static.C_flutter
+        # Flutter effect
+        w_body_horisontal_sq = w_body[0]**2 + w_body[2]**2
+        flutter_factor = np.array([w_body[0], 0, w_body[2]]) * w_body_horisontal_sq**0.5
+        T_flutter = - flutter_factor * self.static.r5_rho_C_flutter_torque_4_on_15
+        
+        b1 = Quaternion.basis_vector(state.q, 1)
+        F_flutter = - w_body_horisontal_sq * self.static.pi_r4_rho_C_flutter_lift_on_8 * b1 
 
         # FORCES
         v_body = Quaternion.rot_inv(state.q, state.v)
@@ -283,13 +324,12 @@ class FrisbeeSimulation:
 
         # assert abs(v_sq - v_length_sq) <= 1e-4, f"Velocity squared mismatch: {v_sq} != {v_length_sq}. {np.linalg.norm(state.q)}"
 
-        Arhov2 = self.static.rho * self.static.area * v_length_sq
 
-        Arrhov2 = Arhov2 * self.static.radius
+        Arrhov2 = v_length_sq * self.static.rho_area_r
 
         # Lift and drag forces relative to the velocity vector (elevated by alpha, the angle of attack)
-        lift_force_vframe = Arhov2 * Cl / 2.0
-        drag_force_vframe = Arhov2 * Cd / 2.0
+        lift_force_vframe = self.static.rho_area_Cl_on_2 * v_length_sq
+        drag_force_vframe = self.static.rho_area_Cd_on_2 * v_length_sq
 
         # Transform lift and drag into flight frame
         lift_force_flight = lift_force_vframe * np.cos(alpha) + \
@@ -297,29 +337,27 @@ class FrisbeeSimulation:
 
         drag_force_flight = lift_force_vframe * np.sin(alpha) - \
             drag_force_vframe * np.cos(alpha)
-        print(f"lift: {lift_force_vframe:.2f}, drag: {drag_force_vframe:.2f}, vel:{v1:.2f} {v_projected_length_sq**0.5:.2f}, alpha: {alpha:.2f}")
         lift_drag_inertial = Quaternion.rot(flight_frame, np.array(
             [drag_force_flight, lift_force_flight, 0], dtype=f64))
         
-        v_flight = Quaternion.rot_inv(flight_frame, state.v)
-        print (f"v_flight: {v_flight[0]:.2f}, {v_flight[1]:.2f}, {v_flight[2]:.2f}")
-
         F_net = np.copy(self.static.F_ext)  # External force in inertial frame
         F_net += self.static.grav
         F_net += lift_drag_inertial
+        F_net += F_flutter
         a_net = F_net / self.static.m  # Net acceleration in inertial frame
 
         # TORQUES
 
-        v_body_dot = Quaternion.rot_inv(
-            state.q, a_net) - np.cross(w_body, v_body)
-        alpha_dot = (v_body_dot[0] * v0*v1
-                     + v_body_dot[2] * v2*v1
-                     - v_body_dot[1] * v_projected_length_sq
-                     ) / (v_length_sq * v_projected_length_sq**0.5)
+        Cm3 = self.static.CM30 + self.static.CM3alpha * alpha
 
-        Cm3 = self.static.CM30 + self.static.CM3alpha * alpha + \
-            self.static.CM3alpha_dot * alpha_dot
+        # v_body_dot = Quaternion.rot_inv(
+        #     state.q, a_net) - np.cross(w_body, v_body)
+        # alpha_dot = (v_body_dot[0] * v0*v1
+        #              + v_body_dot[2] * v2*v1
+        #              - v_body_dot[1] * v_projected_length_sq
+        #              ) / (v_length_sq * v_projected_length_sq**0.5)
+        # Cm3 += self.static.CM3alpha_dot * alpha_dot
+            
 
         m3 = Arrhov2 * Cm3
 
@@ -328,11 +366,9 @@ class FrisbeeSimulation:
         rotation_speed = w_body[1]
 
         flight_to_body = FlightFrameFrisbee.to_body_quaternion(state)
+        
+        T_flutter = Quaternion.rot_inv(flight_to_body, T_flutter)
 
-        Cm1 = (self.static.CM1gamma * rotation_speed + self.static.CM3alpha_dot *
-               (w_body @ Quaternion.rot(flight_to_body, np.array([1., 0., 0.]))))
-
-        m1 = -Arrhov2 * Cm1
 
         m2 = -self.static.CM2Nr * rotation_speed
 
@@ -340,13 +376,16 @@ class FrisbeeSimulation:
 
         flight_moments = np.zeros(3, dtype=f64)
 
+
+        # Cm1 = (self.static.CM1gamma * rotation_speed + self.static.CM3alpha_dot *
+        #        (w_body @ Quaternion.basis_vector(flight_to_body, 0)))
+        # m1 = -Arrhov2 * Cm1
         # flight_moments += m1 * np.array([1, 0, 0])  # Magnus moment
         flight_moments += m2 * np.array([0, 1, 0])  # Spin
         flight_moments += m3 * np.array([0, 0, 1])  # Pitching moment
 
-
+        flight_moments += T_flutter  # Flutter torque   
         T_net += Quaternion.rot(flight_frame, flight_moments)
-        T_net += T_flutter  # Flutter torque
 
         deriv = FrisbeeState(
             L=T_net,
@@ -356,9 +395,10 @@ class FrisbeeSimulation:
             # x=0,
         )
         if cache:
+            print("flutter torque", T_flutter, "flutter force", F_flutter, "total force", F_net, "lift_drag_inertial", lift_drag_inertial)
             self.cache.derivative = deriv
             self.cache.T_flutter = T_flutter
-            self.cache.w_inertial = w_inertial
+            self.cache.w_inertial = Quaternion.rot(state.q, w_body)
             self.cache.T_net = T_net
             self.cache.F_net = F_net
             self.cache.flight_frame = flight_frame

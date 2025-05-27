@@ -1,8 +1,30 @@
-from .header import *
+from ..header import *
 
 
 
 class Quaternion:
+
+    @staticmethod
+    def basis_vector(q: f64array, i: int) -> f64array:
+        """
+        Get the i-th basis vector of a quaternion.
+
+        Parameters:
+        - q: Quaternion (4x1 array)
+        - i: Index of the basis vector (0 for w, 1 for x, 2 for y, 3 for z)
+
+        Returns:
+        - Basis vector (3x1 array)
+        """
+        w, x, y, z = q
+        if i == 0:
+            return 2 * np.array([0.5 - (y**2 + z**2), y*x + z*w, z*x -y*w])
+        elif i == 1:
+            return 2 * np.array([y*x - z*w, 0.5 - (x**2 + z**2), z*y + x*w])
+        elif i == 2:
+            return 2 * np.array([z*x + y*w, z*y -x*w, 0.5 - (x**2 + y**2)])
+        else:
+            raise ValueError("Index must be 0, 1, 2")
 
     @staticmethod
     def angvel_to_deriv(q: f64array, omega: f64array) -> f64array:
@@ -18,7 +40,6 @@ class Quaternion:
         """
         omega_quat = np.array([0.0, omega[0], omega[1], omega[2]])
         dq = 0.5 * Quaternion.mul(q, omega_quat)
-
         return dq
     
     @staticmethod
